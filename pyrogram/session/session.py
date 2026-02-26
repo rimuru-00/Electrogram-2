@@ -59,7 +59,7 @@ class Session:
     # Dead session detector: if invoke() is waiting for is_started to be set
     # for longer than this, restart() is clearly stuck. Raise a clear error
     # instead of hanging the caller forever (which was the original stuck bug).
-    IS_STARTED_WAIT_TIMEOUT = 60
+    IS_STARTED_WAIT_TIMEOUT = 120
 
     TRANSPORT_ERRORS: ClassVar[dict[int, str]] = {
         404: "auth key not found",
