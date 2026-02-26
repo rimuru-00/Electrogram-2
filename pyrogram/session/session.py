@@ -1,3 +1,5 @@
+# pyrogram/session/session.py
+
 # ruff: noqa: RUF006
 from __future__ import annotations
 
@@ -55,11 +57,6 @@ class Session:
     # After RE_START_RANGE fast attempts fail, delays go:
     # 2s → 4s → 8s → 16s → 32s → 60s (capped here forever until connected).
     MAX_RECONNECT_DELAY = 60
-
-    # Dead session detector: if invoke() is waiting for is_started to be set
-    # for longer than this, restart() is clearly stuck. Raise a clear error
-    # instead of hanging the caller forever (which was the original stuck bug).
-    IS_STARTED_WAIT_TIMEOUT = 120
 
     TRANSPORT_ERRORS: ClassVar[dict[int, str]] = {
         404: "auth key not found",
@@ -654,30 +651,7 @@ class Session:
                 return None
 
             if not self.is_started.is_set():
-                # Dead session detector: instead of waiting forever on
-                # is_started, apply a hard timeout. If restart() hasn't
-                # recovered within IS_STARTED_WAIT_TIMEOUT seconds the
-                # session is unrecoverable in its current state — raise a
-                # clear error so the caller can handle it, instead of
-                # silently hanging the entire bot.
-                try:
-                    await asyncio.wait_for(
-                        self.is_started.wait(),
-                        timeout=self.IS_STARTED_WAIT_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    log.error(
-                        "[%s] Session DC%s did not recover within %ss "
-                        "— aborting invoke() for \"%s\"",
-                        self.client.name,
-                        self.dc_id,
-                        self.IS_STARTED_WAIT_TIMEOUT,
-                        query_name,
-                    )
-                    raise asyncio.TimeoutError(
-                        f"Session DC{self.dc_id} did not recover in time "
-                        f"for request \"{query_name}\""
-                    )
+                await self.is_started.wait()
 
             try:
                 return await self.send(query, timeout=timeout)
