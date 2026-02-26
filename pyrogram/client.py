@@ -1,5 +1,3 @@
-# pyrogram/client.py
-
 from __future__ import annotations
 
 import asyncio
@@ -1071,9 +1069,33 @@ class Client(Methods):
                     current_time = time.time()
 
                     session_timestamp = self.media_sessions_timestamps.get(dc_id, 0)
-                    if not session or (current_time - session_timestamp > 21600):
+                    need_new_session = not session or (current_time - session_timestamp > 21600)
+
+                    if not need_new_session:
+                        # Within TTL — health check before trusting it.
+                        # Stage 1: is_started flag (free, no network).
+                        # Stage 2: real Ping with 5s timeout — catches silently
+                        # dropped TCP connections (common on Heroku between jobs).
+                        healthy = session.is_started.is_set()
+                        if healthy:
+                            try:
+                                await asyncio.wait_for(
+                                    session.invoke(raw.functions.Ping(ping_id=0)),
+                                    timeout=5.0,
+                                )
+                            except Exception as e:
+                                healthy = False
+                                log.debug(
+                                    "[%s] Download session DC%s ping failed (%s) — rebuilding",
+                                    self.name, dc_id, e,
+                                )
+                        if not healthy:
+                            need_new_session = True
+
+                    if need_new_session:
                         if session:
-                            await session.stop()
+                            with contextlib.suppress(Exception):
+                                await session.stop()
 
                         session = Session(
                             self, dc_id,
