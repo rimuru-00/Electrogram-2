@@ -9,7 +9,6 @@ import os
 import platform
 import re
 import shutil
-import signal
 import sys
 import time
 from collections import OrderedDict
@@ -229,10 +228,6 @@ class Client(Methods):
     UPDATES_WATCHDOG_INTERVAL = 10 * 60
     MAX_CONCURRENT_TRANSMISSIONS = 1000
     MAX_MESSAGE_CACHE_SIZE = 10000
-    # How often (seconds) the session watchdog checks all cached sessions.
-    # 5 minutes is frequent enough to catch stale connections before they
-    # break a transfer, but cheap enough to not add meaningful overhead.
-    SESSION_WATCHDOG_INTERVAL = 5 * 60
     mimetypes = MimeTypes()
     mimetypes.readfp(StringIO(mime_types))
 
@@ -363,15 +358,10 @@ class Client(Methods):
         self.updates_watchdog_event = asyncio.Event()
         self.updates_invoke_error = None
         self.last_update_time = datetime.now()
-        # Session watchdog task — proactively pings all cached sessions
-        self.session_watchdog_task = None
-        self.session_watchdog_stop = asyncio.Event()
         self.listeners = {
             listener_type: [] for listener_type in pyrogram.enums.ListenerTypes
         }
         self.loop = asyncio.get_event_loop()
-        # Register SIGTERM/SIGINT handlers for graceful Heroku shutdown
-        self._register_signal_handlers()
 
     def __enter__(self):
         return self.start()
@@ -381,19 +371,9 @@ class Client(Methods):
             self.stop()
 
     async def __aenter__(self):
-        result = await self.start()
-        # Start session watchdog after client is connected
-        self.session_watchdog_stop.clear()
-        self.session_watchdog_task = asyncio.create_task(self.session_watchdog())
-        return result
+        return await self.start()
 
     async def __aexit__(self, *args):
-        # Stop session watchdog before disconnecting
-        self.session_watchdog_stop.set()
-        if self.session_watchdog_task:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.session_watchdog_task, timeout=5.0)
-        await self._stop_all_media_sessions()
         with contextlib.suppress(ConnectionError):
             await self.stop()
 
@@ -414,136 +394,7 @@ class Client(Methods):
             ):
                 await self.invoke(raw.functions.updates.GetState())
 
-    async def session_watchdog(self) -> None:
-        """
-        Proactive session health monitor.
-
-        Runs every SESSION_WATCHDOG_INTERVAL seconds and pings every cached
-        session (downloads + uploads). If a session fails the ping it is
-        evicted and rebuilt immediately — before it breaks a live transfer.
-
-        This is especially important on Heroku where TCP connections are
-        silently dropped by the network layer after ~30s of idle time. Without
-        this, the first file transfer after a quiet period always hits a dead
-        session and has to fail-and-rebuild reactively.
-        """
-        log.info("[%s] Session watchdog started", self.name)
-
-        while not self.session_watchdog_stop.is_set():
-            try:
-                await asyncio.wait_for(
-                    self.session_watchdog_stop.wait(),
-                    self.SESSION_WATCHDOG_INTERVAL,
-                )
-                # Stop event was set — exit cleanly
-                break
-            except asyncio.TimeoutError:
-                pass
-
-            # Check all download sessions
-            async with self.media_sessions_lock:
-                for dc_id in list(self.media_sessions.keys()):
-                    session = self.media_sessions[dc_id]
-                    try:
-                        await asyncio.wait_for(
-                            session.invoke(raw.functions.Ping(ping_id=0)),
-                            timeout=5.0,
-                        )
-                        log.debug(
-                            "[%s] Watchdog: download session DC%s OK",
-                            self.name, dc_id,
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "[%s] Watchdog: download session DC%s failed ping (%s) — evicting",
-                            self.name, dc_id, e,
-                        )
-                        self.media_sessions.pop(dc_id, None)
-                        self.media_sessions_timestamps.pop(dc_id, None)
-                        with contextlib.suppress(Exception):
-                            await session.stop()
-
-            # Check all upload sessions
-            async with self.upload_sessions_lock:
-                for dc_id in list(self.upload_sessions.keys()):
-                    session = self.upload_sessions[dc_id]
-                    try:
-                        await asyncio.wait_for(
-                            session.invoke(raw.functions.Ping(ping_id=0)),
-                            timeout=5.0,
-                        )
-                        log.debug(
-                            "[%s] Watchdog: upload session DC%s OK",
-                            self.name, dc_id,
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "[%s] Watchdog: upload session DC%s failed ping (%s) — evicting",
-                            self.name, dc_id, e,
-                        )
-                        self.upload_sessions.pop(dc_id, None)
-                        self.upload_sessions_timestamps.pop(dc_id, None)
-                        with contextlib.suppress(Exception):
-                            await session.stop()
-
-        log.info("[%s] Session watchdog stopped", self.name)
-
-    async def _stop_all_media_sessions(self) -> None:
-        """Stop and clear all cached download and upload sessions."""
-        async with self.media_sessions_lock:
-            for dc_id, session in list(self.media_sessions.items()):
-                with contextlib.suppress(Exception):
-                    await session.stop()
-            self.media_sessions.clear()
-            self.media_sessions_timestamps.clear()
-
-        async with self.upload_sessions_lock:
-            for dc_id, session in list(self.upload_sessions.items()):
-                with contextlib.suppress(Exception):
-                    await session.stop()
-            self.upload_sessions.clear()
-            self.upload_sessions_timestamps.clear()
-
-    def _register_signal_handlers(self) -> None:
-        """
-        Graceful shutdown on Heroku SIGTERM.
-
-        Heroku sends SIGTERM before killing the dyno (30s window). Without
-        handling this, all cached sessions are abandoned mid-state. On next
-        boot Telegram sometimes sees the old auth keys as still active and
-        returns AuthKeyDuplicated or connection errors until they expire.
-
-        This handler stops all cached sessions cleanly so next boot
-        reconnects fresh.
-        """
-        def _on_sigterm():
-            log.warning("[%s] SIGTERM received — shutting down cleanly", self.name)
-            asyncio.create_task(self._graceful_shutdown())
-
-        try:
-            self.loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-            self.loop.add_signal_handler(signal.SIGINT, _on_sigterm)
-            log.info("[%s] Signal handlers registered (SIGTERM, SIGINT)", self.name)
-        except (NotImplementedError, RuntimeError):
-            # Windows or non-main thread — signal handlers not supported
-            log.debug("[%s] Signal handlers not available on this platform", self.name)
-
-    async def _graceful_shutdown(self) -> None:
-        """Clean stop of all sessions before the process dies."""
-        log.info("[%s] Graceful shutdown started", self.name)
-
-        # Stop session watchdog
-        self.session_watchdog_stop.set()
-        if self.session_watchdog_task:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.session_watchdog_task, timeout=5.0)
-
-        # Stop all cached sessions
-        await self._stop_all_media_sessions()
-
-        log.info("[%s] Graceful shutdown complete", self.name)
-
-
+    async def authorize(self) -> User | None:
         if self.bot_token:
             return await self.sign_in_bot(self.bot_token)
 
@@ -1211,7 +1062,7 @@ class Client(Methods):
 
             dc_id = file_id.dc_id
 
-            # ── Your session caching logic, preserved exactly ────────────────
+            # â”€â”€ Your session caching logic, preserved exactly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             try:
                 async with self.media_sessions_lock:
                     session = self.media_sessions.get(dc_id)
@@ -1389,7 +1240,7 @@ class Client(Methods):
                 raise
             except Exception as e:
                 log.exception(e)
-            # NOTE: session is intentionally NOT stopped here — it is cached.
+            # NOTE: session is intentionally NOT stopped here â€” it is cached.
 
     @overload
     def guess_mime_type(self, filename: str) -> str | None: ...
