@@ -8,7 +8,6 @@ import bisect
 import contextlib
 import logging
 import os
-import random
 from hashlib import sha1
 from io import BytesIO
 from time import time
@@ -684,15 +683,6 @@ class Session:
                 if isinstance(amount, int) and amount > sleep_threshold >= 0:
                     raise
 
-                # Add a small random jitter to the flood wait sleep.
-                # Without jitter, all parallel workers receive the same
-                # FloodWait, sleep the exact same duration, then wake up
-                # and fire again simultaneously — causing another FloodWait.
-                # Jitter desynchronizes them so they retry at different times,
-                # breaking the thundering herd cycle entirely.
-                # Jitter is capped at 1s so it never meaningfully delays long waits.
-                jitter = random.uniform(0, min(1.0, amount * 0.1))
-
                 log.warning(
                     '[%s] Waiting for %s seconds before continuing (required by "%s")',
                     self.client.name,
@@ -700,7 +690,7 @@ class Session:
                     query_name,
                 )
 
-                await asyncio.sleep(amount + jitter)
+                await asyncio.sleep(amount)
             except (
                 OSError,
                 RuntimeError,
