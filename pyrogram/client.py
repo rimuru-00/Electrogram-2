@@ -1133,6 +1133,21 @@ class Client(Methods):
                         self.media_sessions[dc_id] = session
                         self.media_sessions_timestamps[dc_id] = current_time
 
+                # ── Dynamic worker count based on file size ───────────────────
+                # < 50 MB  → 1 worker  : sequential, no parallel overhead
+                # < 200 MB → 4 workers : light parallelism
+                # < 500 MB → 8 workers : medium parallelism
+                # ≥ 500 MB → 15 workers: full sliding window, maximum throughput
+                # file_size == 0 means unknown (streaming) — use 8 as safe default.
+                if file_size >= 500 * 1024 * 1024:
+                    num_workers = 15
+                elif file_size >= 200 * 1024 * 1024:
+                    num_workers = 8
+                elif file_size >= 50 * 1024 * 1024:
+                    num_workers = 4
+                else:
+                    num_workers = 1
+
                 r = await session.invoke(
                     raw.functions.upload.GetFile(
                         location=location,
@@ -1143,42 +1158,194 @@ class Client(Methods):
                 )
 
                 if isinstance(r, raw.types.upload.File):
-                    while True:
-                        chunk = r.bytes
+                    first_chunk = r.bytes
+                    # If the very first chunk is already the last (file < 1 MB or
+                    # exactly on a boundary), skip parallel setup entirely.
+                    first_is_last = len(first_chunk) < chunk_size or (current + 1) >= total
 
-                        yield chunk
+                    if num_workers == 1 or first_is_last:
+                        # ── Sequential path ───────────────────────────────────
+                        chunk = first_chunk
+                        while True:
+                            yield chunk
+                            current += 1
+                            offset_bytes += chunk_size
 
-                        current += 1
-                        offset_bytes += chunk_size
+                            if progress:
+                                func = functools.partial(
+                                    progress,
+                                    min(offset_bytes, file_size)
+                                    if file_size != 0
+                                    else offset_bytes,
+                                    file_size,
+                                    *progress_args,
+                                )
+                                if inspect.iscoroutinefunction(progress):
+                                    await func()
+                                else:
+                                    await self.loop.run_in_executor(self.executor, func)
 
-                        if progress:
-                            func = functools.partial(
-                                progress,
-                                min(offset_bytes, file_size)
-                                if file_size != 0
-                                else offset_bytes,
-                                file_size,
-                                *progress_args
+                            if len(chunk) < chunk_size or current >= total:
+                                break
+
+                            r = await session.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=location,
+                                    offset=offset_bytes,
+                                    limit=chunk_size,
+                                ),
+                                sleep_threshold=30,
                             )
+                            chunk = r.bytes
 
-                            if inspect.iscoroutinefunction(progress):
-                                await func()
-                            else:
-                                await self.loop.run_in_executor(self.executor, func)
+                    else:
+                        # ── Parallel sliding-window path ──────────────────────
+                        #
+                        # How it works:
+                        # • num_workers coroutines each loop: pop an offset from
+                        #   work_q → invoke GetFile → store bytes in buffer → signal
+                        #   buffer_event so the main loop can drain in order.
+                        # • The main loop yields chunks strictly in offset order using
+                        #   buffer (dict[offset → bytes]) and next_yield_offset cursor.
+                        # • After yielding each chunk the main loop schedules the next
+                        #   offset into work_q, keeping exactly num_workers requests
+                        #   in-flight at all times (sliding window).
+                        # • A single MTProto session handles all workers safely —
+                        #   concurrent invoke() calls are multiplexed via msg_id,
+                        #   exactly as save_file.py does for uploads.
+                        # • FloodWait is handled inside session.invoke() per-coroutine:
+                        #   only the affected worker sleeps; others keep running.
+                        # • stop_event is set on EOF (short chunk) or any error so the
+                        #   window stops growing and workers exit cleanly.
 
-                        if len(chunk) < chunk_size or current >= total:
-                            break
+                        buffer: dict[int, bytes] = {offset_bytes: first_chunk}
+                        next_yield_offset = offset_bytes
+                        # window_offset tracks the next offset we haven't scheduled yet
+                        window_offset = offset_bytes + chunk_size
+                        scheduled_count = 1  # first chunk already fetched above
 
-                        r = await session.invoke(
-                            raw.functions.upload.GetFile(
-                                location=location,
-                                offset=offset_bytes,
-                                limit=chunk_size
-                            ),
-                            sleep_threshold=30
-                        )
+                        buffer_event = asyncio.Event()
+                        buffer_event.set()  # first chunk is already in buffer
+                        stop_event = asyncio.Event()
+                        error_holder: list[BaseException | None] = [None]
+                        work_q: asyncio.Queue[int | None] = asyncio.Queue()
+
+                        async def _fetch_worker() -> None:
+                            while not stop_event.is_set():
+                                try:
+                                    fetch_offset = await asyncio.wait_for(
+                                        work_q.get(), timeout=0.5
+                                    )
+                                except asyncio.TimeoutError:
+                                    continue
+
+                                # None is the shutdown sentinel
+                                if fetch_offset is None:
+                                    return
+
+                                try:
+                                    resp = await session.invoke(
+                                        raw.functions.upload.GetFile(
+                                            location=location,
+                                            offset=fetch_offset,
+                                            limit=chunk_size,
+                                        ),
+                                        sleep_threshold=30,
+                                    )
+                                    buffer[fetch_offset] = resp.bytes
+                                    buffer_event.set()
+                                    # Short chunk means this is the final chunk — stop
+                                    # scheduling more work after this point.
+                                    if len(resp.bytes) < chunk_size:
+                                        stop_event.set()
+                                except Exception as exc:
+                                    error_holder[0] = exc
+                                    stop_event.set()
+                                    buffer_event.set()
+                                    return
+
+                        tasks = [
+                            self.loop.create_task(_fetch_worker())
+                            for _ in range(num_workers)
+                        ]
+
+                        try:
+                            # Prime the window: schedule (num_workers - 1) additional
+                            # offsets. The first chunk is already in the buffer so we
+                            # start scheduling from the second chunk offset.
+                            for _ in range(num_workers - 1):
+                                if stop_event.is_set() or scheduled_count >= total:
+                                    break
+                                await work_q.put(window_offset)
+                                window_offset += chunk_size
+                                scheduled_count += 1
+
+                            while True:
+                                # Wait until the chunk at next_yield_offset has arrived.
+                                # Pattern: clear() then wait() with no await in between
+                                # is safe in asyncio — no worker can slip in and set
+                                # the event between our clear and our wait because
+                                # there is no yield point between them.
+                                while next_yield_offset not in buffer:
+                                    if error_holder[0] is not None:
+                                        raise error_holder[0]
+                                    buffer_event.clear()
+                                    await buffer_event.wait()
+
+                                if error_holder[0] is not None:
+                                    raise error_holder[0]
+
+                                chunk = buffer.pop(next_yield_offset)
+                                yield chunk
+
+                                current += 1
+                                next_yield_offset += chunk_size
+
+                                if progress:
+                                    func = functools.partial(
+                                        progress,
+                                        min(next_yield_offset, file_size)
+                                        if file_size != 0
+                                        else next_yield_offset,
+                                        file_size,
+                                        *progress_args,
+                                    )
+                                    if inspect.iscoroutinefunction(progress):
+                                        await func()
+                                    else:
+                                        await self.loop.run_in_executor(
+                                            self.executor, func
+                                        )
+
+                                if len(chunk) < chunk_size or current >= total:
+                                    break
+
+                                # Slide the window: one chunk consumed → schedule one
+                                # new chunk so the number of in-flight requests stays
+                                # constant at num_workers.
+                                if not stop_event.is_set() and scheduled_count < total:
+                                    await work_q.put(window_offset)
+                                    window_offset += chunk_size
+                                    scheduled_count += 1
+
+                        finally:
+                            # Signal all workers to stop, drain the queue so no worker
+                            # is stuck waiting on work_q.get(), then wait for clean exit.
+                            stop_event.set()
+                            while not work_q.empty():
+                                try:
+                                    work_q.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            for _ in tasks:
+                                await work_q.put(None)
+                            await asyncio.gather(*tasks, return_exceptions=True)
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                    # CDN path — sequential (CDN chunks require per-chunk AES decrypt
+                    # + hash verification via a second invoke, making parallelism
+                    # significantly more complex for minimal real-world gain since
+                    # CDN redirects are rare and already fast).
                     cdn_session = Session(
                         self, r.dc_id, await Auth(self, r.dc_id, await self.storage.test_mode()).create(),
                         await self.storage.test_mode(), is_media=True, is_cdn=True
