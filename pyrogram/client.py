@@ -335,6 +335,7 @@ class Client(Methods):
         # built so stale connections are refreshed after 21600s (your value).
         self.media_sessions: dict[int, Session] = {}
         self.media_sessions_timestamps: dict[int, float] = {}
+        self.media_sessions_last_used: dict[int, float] = {}
         self.media_sessions_lock = asyncio.Lock()
         # upload_sessions: separate cached session pool for uploads.
         # Kept separate from media_sessions so a long upload never evicts
@@ -1015,6 +1016,19 @@ class Client(Methods):
         progress: Callable | None = None,
         progress_args: tuple = (),
     ) -> AsyncGenerator[bytes, None]:
+        # How many chunks to prefetch in parallel for large files.
+        # Kept at 4 — same as save_file's upload worker count —
+        # which is proven safe on a single MTProto session.
+        # Only activated for files > 10 MB; small files finish in
+        # 1–2 chunks so parallelism adds overhead with no benefit.
+        _PREFETCH_COUNT = 4
+        _BIG_FILE_THRESHOLD = 10 * 1024 * 1024
+
+        # Skip the network ping if the session was used within this
+        # many seconds — a recently active socket is almost certainly
+        # alive, and the ping adds a full RTT before every download.
+        _PING_IDLE_THRESHOLD = 30.0
+
         async with self.get_file_semaphore:
             file_type = file_id.file_type
 
@@ -1062,7 +1076,6 @@ class Client(Methods):
 
             dc_id = file_id.dc_id
 
-            # ── Your session caching logic, preserved exactly ────────────────
             try:
                 async with self.media_sessions_lock:
                     session = self.media_sessions.get(dc_id)
@@ -1072,23 +1085,38 @@ class Client(Methods):
                     need_new_session = not session or (current_time - session_timestamp > 21600)
 
                     if not need_new_session:
-                        # Within TTL — health check before trusting it.
-                        # Stage 1: is_started flag (free, no network).
-                        # Stage 2: real Ping with 5s timeout — catches silently
-                        # dropped TCP connections (common on Heroku between jobs).
+                        # Stage 1: is_started flag — free, no network.
                         healthy = session.is_started.is_set()
+
+                        # Stage 2: real Ping, but only if session has been
+                        # idle long enough to plausibly have a dead socket.
+                        # Skipping this on active sessions removes one full
+                        # RTT of latency at the start of every download.
                         if healthy:
-                            try:
-                                await asyncio.wait_for(
-                                    session.invoke(raw.functions.Ping(ping_id=0)),
-                                    timeout=5.0,
-                                )
-                            except Exception as e:
-                                healthy = False
+                            last_used = self.media_sessions_last_used.get(dc_id, 0)
+                            idle_seconds = current_time - last_used
+                            if idle_seconds > _PING_IDLE_THRESHOLD:
+                                try:
+                                    await asyncio.wait_for(
+                                        session.invoke(raw.functions.Ping(ping_id=0)),
+                                        timeout=5.0,
+                                    )
+                                    log.debug(
+                                        "[%s] Download session DC%s ping OK (idle %.0fs)",
+                                        self.name, dc_id, idle_seconds,
+                                    )
+                                except Exception as e:
+                                    healthy = False
+                                    log.debug(
+                                        "[%s] Download session DC%s ping failed (%s) — rebuilding",
+                                        self.name, dc_id, e,
+                                    )
+                            else:
                                 log.debug(
-                                    "[%s] Download session DC%s ping failed (%s) — rebuilding",
-                                    self.name, dc_id, e,
+                                    "[%s] Download session DC%s skipping ping (idle %.1fs < %.0fs)",
+                                    self.name, dc_id, idle_seconds, _PING_IDLE_THRESHOLD,
                                 )
+
                         if not healthy:
                             need_new_session = True
 
@@ -1132,51 +1160,109 @@ class Client(Methods):
 
                         self.media_sessions[dc_id] = session
                         self.media_sessions_timestamps[dc_id] = current_time
+                        self.media_sessions_last_used[dc_id] = current_time
 
-                # ── Dynamic worker count based on file size ───────────────────
-                # < 50 MB  → 1 worker  : sequential, no parallel overhead
-                # < 200 MB → 4 workers : light parallelism
-                # < 500 MB → 8 workers : medium parallelism
-                # ≥ 500 MB → 15 workers: full sliding window, maximum throughput
-                # file_size == 0 means unknown (streaming) — use 8 as safe default.
-                if file_size >= 500 * 1024 * 1024:
-                    num_workers = 15
-                elif file_size >= 200 * 1024 * 1024:
-                    num_workers = 8
-                elif file_size >= 50 * 1024 * 1024:
-                    num_workers = 4
-                else:
-                    num_workers = 1
+                # ── Helper: fetch one chunk, returns (ordered_index, bytes) ──
+                async def fetch_chunk(ob: int) -> bytes:
+                    r = await session.invoke(
+                        raw.functions.upload.GetFile(
+                            location=location,
+                            offset=ob,
+                            limit=chunk_size,
+                        ),
+                        sleep_threshold=30,
+                    )
+                    return r.bytes if isinstance(r, raw.types.upload.File) else b""
 
-                r = await session.invoke(
-                    raw.functions.upload.GetFile(
-                        location=location,
-                        offset=offset_bytes,
-                        limit=chunk_size
-                    ),
-                    sleep_threshold=30
-                )
+                is_big = file_size > _BIG_FILE_THRESHOLD
+                use_prefetch = is_big and limit == 0  # prefetch only for full-file downloads
 
-                if isinstance(r, raw.types.upload.File):
-                    first_chunk = r.bytes
-                    # If the very first chunk is already the last (file < 1 MB or
-                    # exactly on a boundary), skip parallel setup entirely.
-                    first_is_last = len(first_chunk) < chunk_size or (current + 1) >= total
+                if use_prefetch:
+                    # ── Parallel prefetch path (large files only) ─────────────
+                    # Launch up to _PREFETCH_COUNT futures at once.
+                    # All share the same cached session — MTProto multiplexes
+                    # them safely over the single TCP connection.
+                    # Chunks are collected and yielded strictly in order so the
+                    # caller always gets a contiguous byte stream.
+                    pending: list[asyncio.Task] = []
+                    next_offset = offset_bytes
 
-                    if num_workers == 1 or first_is_last:
-                        # ── Sequential path ───────────────────────────────────
-                        chunk = first_chunk
-                        while True:
+                    # Seed the pipeline
+                    for _ in range(_PREFETCH_COUNT):
+                        pending.append(self.loop.create_task(fetch_chunk(next_offset)))
+                        next_offset += chunk_size
+
+                    try:
+                        while pending:
+                            # Await the oldest in-flight chunk (strict ordering)
+                            chunk = await pending.pop(0)
+
+                            if not chunk:
+                                # Cancel any remaining prefetch tasks
+                                for t in pending:
+                                    t.cancel()
+                                pending.clear()
+                                break
+
                             yield chunk
+                            self.media_sessions_last_used[dc_id] = time.time()
+
                             current += 1
                             offset_bytes += chunk_size
 
                             if progress:
                                 func = functools.partial(
                                     progress,
-                                    min(offset_bytes, file_size)
-                                    if file_size != 0
-                                    else offset_bytes,
+                                    min(offset_bytes, file_size) if file_size != 0 else offset_bytes,
+                                    file_size,
+                                    *progress_args,
+                                )
+                                if inspect.iscoroutinefunction(progress):
+                                    await func()
+                                else:
+                                    await self.loop.run_in_executor(self.executor, func)
+
+                            if len(chunk) < chunk_size or current >= total:
+                                # Done — cancel remaining prefetch tasks
+                                for t in pending:
+                                    t.cancel()
+                                pending.clear()
+                                break
+
+                            # Slide window: launch the next chunk
+                            pending.append(self.loop.create_task(fetch_chunk(next_offset)))
+                            next_offset += chunk_size
+
+                    except (pyrogram.StopTransmissionError, FloodWait, FloodPremiumWait):
+                        for t in pending:
+                            t.cancel()
+                        raise
+
+                else:
+                    # ── Sequential path (small files / streaming) ─────────────
+                    r = await session.invoke(
+                        raw.functions.upload.GetFile(
+                            location=location,
+                            offset=offset_bytes,
+                            limit=chunk_size,
+                        ),
+                        sleep_threshold=30,
+                    )
+
+                    if isinstance(r, raw.types.upload.File):
+                        while True:
+                            chunk = r.bytes
+
+                            yield chunk
+                            self.media_sessions_last_used[dc_id] = time.time()
+
+                            current += 1
+                            offset_bytes += chunk_size
+
+                            if progress:
+                                func = functools.partial(
+                                    progress,
+                                    min(offset_bytes, file_size) if file_size != 0 else offset_bytes,
                                     file_size,
                                     *progress_args,
                                 )
@@ -1196,235 +1282,94 @@ class Client(Methods):
                                 ),
                                 sleep_threshold=30,
                             )
-                            chunk = r.bytes
 
-                    else:
-                        # ── Parallel sliding-window path ──────────────────────
-                        #
-                        # How it works:
-                        # • num_workers coroutines each loop: pop an offset from
-                        #   work_q → invoke GetFile → store bytes in buffer → signal
-                        #   buffer_event so the main loop can drain in order.
-                        # • The main loop yields chunks strictly in offset order using
-                        #   buffer (dict[offset → bytes]) and next_yield_offset cursor.
-                        # • After yielding each chunk the main loop schedules the next
-                        #   offset into work_q, keeping exactly num_workers requests
-                        #   in-flight at all times (sliding window).
-                        # • A single MTProto session handles all workers safely —
-                        #   concurrent invoke() calls are multiplexed via msg_id,
-                        #   exactly as save_file.py does for uploads.
-                        # • FloodWait is handled inside session.invoke() per-coroutine:
-                        #   only the affected worker sleeps; others keep running.
-                        # • stop_event is set on EOF (short chunk) or any error so the
-                        #   window stops growing and workers exit cleanly.
-
-                        buffer: dict[int, bytes] = {offset_bytes: first_chunk}
-                        next_yield_offset = offset_bytes
-                        # window_offset tracks the next offset we haven't scheduled yet
-                        window_offset = offset_bytes + chunk_size
-                        scheduled_count = 1  # first chunk already fetched above
-
-                        buffer_event = asyncio.Event()
-                        buffer_event.set()  # first chunk is already in buffer
-                        stop_event = asyncio.Event()
-                        error_holder: list[BaseException | None] = [None]
-                        work_q: asyncio.Queue[int | None] = asyncio.Queue()
-
-                        async def _fetch_worker() -> None:
-                            while not stop_event.is_set():
-                                try:
-                                    fetch_offset = await asyncio.wait_for(
-                                        work_q.get(), timeout=0.5
-                                    )
-                                except asyncio.TimeoutError:
-                                    continue
-
-                                # None is the shutdown sentinel
-                                if fetch_offset is None:
-                                    return
-
-                                try:
-                                    resp = await session.invoke(
-                                        raw.functions.upload.GetFile(
-                                            location=location,
-                                            offset=fetch_offset,
-                                            limit=chunk_size,
-                                        ),
-                                        sleep_threshold=30,
-                                    )
-                                    buffer[fetch_offset] = resp.bytes
-                                    buffer_event.set()
-                                    # Short chunk means this is the final chunk — stop
-                                    # scheduling more work after this point.
-                                    if len(resp.bytes) < chunk_size:
-                                        stop_event.set()
-                                except Exception as exc:
-                                    error_holder[0] = exc
-                                    stop_event.set()
-                                    buffer_event.set()
-                                    return
-
-                        tasks = [
-                            self.loop.create_task(_fetch_worker())
-                            for _ in range(num_workers)
-                        ]
+                    elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                        # ── CDN path — intentionally left sequential ──────────
+                        # CDN chunks require interleaved GetCdnFileHashes calls
+                        # on the main session for hash verification. Parallelising
+                        # this would race those hash calls against each other,
+                        # making the CDNFileHashMismatch check unreliable.
+                        cdn_session = Session(
+                            self, r.dc_id,
+                            await Auth(self, r.dc_id, await self.storage.test_mode()).create(),
+                            await self.storage.test_mode(), is_media=True, is_cdn=True,
+                        )
 
                         try:
-                            # Prime the window: schedule (num_workers - 1) additional
-                            # offsets. The first chunk is already in the buffer so we
-                            # start scheduling from the second chunk offset.
-                            for _ in range(num_workers - 1):
-                                if stop_event.is_set() or scheduled_count >= total:
-                                    break
-                                await work_q.put(window_offset)
-                                window_offset += chunk_size
-                                scheduled_count += 1
+                            await cdn_session.start()
 
                             while True:
-                                # Wait until the chunk at next_yield_offset has arrived.
-                                # Pattern: clear() then wait() with no await in between
-                                # is safe in asyncio — no worker can slip in and set
-                                # the event between our clear and our wait because
-                                # there is no yield point between them.
-                                while next_yield_offset not in buffer:
-                                    if error_holder[0] is not None:
-                                        raise error_holder[0]
-                                    buffer_event.clear()
-                                    await buffer_event.wait()
+                                r2 = await cdn_session.invoke(
+                                    raw.functions.upload.GetCdnFile(
+                                        file_token=r.file_token,
+                                        offset=offset_bytes,
+                                        limit=chunk_size,
+                                    )
+                                )
 
-                                if error_holder[0] is not None:
-                                    raise error_holder[0]
+                                if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
+                                    try:
+                                        await session.invoke(
+                                            raw.functions.upload.ReuploadCdnFile(
+                                                file_token=r.file_token,
+                                                request_token=r2.request_token,
+                                            )
+                                        )
+                                    except VolumeLocNotFound:
+                                        break
+                                    else:
+                                        continue
 
-                                chunk = buffer.pop(next_yield_offset)
-                                yield chunk
+                                chunk = r2.bytes
+
+                                decrypted_chunk = aes.ctr256_decrypt(
+                                    chunk,
+                                    r.encryption_key,
+                                    bytearray(
+                                        r.encryption_iv[:-4]
+                                        + (offset_bytes // 16).to_bytes(4, "big")
+                                    ),
+                                )
+
+                                hashes = await session.invoke(
+                                    raw.functions.upload.GetCdnFileHashes(
+                                        file_token=r.file_token,
+                                        offset=offset_bytes,
+                                    )
+                                )
+
+                                for i, h in enumerate(hashes):
+                                    cdn_chunk = decrypted_chunk[h.limit * i: h.limit * (i + 1)]
+                                    CDNFileHashMismatch.check(
+                                        h.hash == sha256(cdn_chunk).digest(),
+                                        "h.hash == sha256(cdn_chunk).digest()",
+                                    )
+
+                                yield decrypted_chunk
+                                self.media_sessions_last_used[dc_id] = time.time()
 
                                 current += 1
-                                next_yield_offset += chunk_size
+                                offset_bytes += chunk_size
 
                                 if progress:
                                     func = functools.partial(
                                         progress,
-                                        min(next_yield_offset, file_size)
-                                        if file_size != 0
-                                        else next_yield_offset,
+                                        min(offset_bytes, file_size) if file_size != 0 else offset_bytes,
                                         file_size,
                                         *progress_args,
                                     )
                                     if inspect.iscoroutinefunction(progress):
                                         await func()
                                     else:
-                                        await self.loop.run_in_executor(
-                                            self.executor, func
-                                        )
+                                        await self.loop.run_in_executor(self.executor, func)
 
                                 if len(chunk) < chunk_size or current >= total:
                                     break
-
-                                # Slide the window: one chunk consumed → schedule one
-                                # new chunk so the number of in-flight requests stays
-                                # constant at num_workers.
-                                if not stop_event.is_set() and scheduled_count < total:
-                                    await work_q.put(window_offset)
-                                    window_offset += chunk_size
-                                    scheduled_count += 1
-
+                        except Exception as e:
+                            raise e
                         finally:
-                            # Signal all workers to stop, drain the queue so no worker
-                            # is stuck waiting on work_q.get(), then wait for clean exit.
-                            stop_event.set()
-                            while not work_q.empty():
-                                try:
-                                    work_q.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
-                            for _ in tasks:
-                                await work_q.put(None)
-                            await asyncio.gather(*tasks, return_exceptions=True)
+                            await cdn_session.stop()
 
-                elif isinstance(r, raw.types.upload.FileCdnRedirect):
-                    # CDN path — sequential (CDN chunks require per-chunk AES decrypt
-                    # + hash verification via a second invoke, making parallelism
-                    # significantly more complex for minimal real-world gain since
-                    # CDN redirects are rare and already fast).
-                    cdn_session = Session(
-                        self, r.dc_id, await Auth(self, r.dc_id, await self.storage.test_mode()).create(),
-                        await self.storage.test_mode(), is_media=True, is_cdn=True
-                    )
-
-                    try:
-                        await cdn_session.start()
-
-                        while True:
-                            r2 = await cdn_session.invoke(
-                                raw.functions.upload.GetCdnFile(
-                                    file_token=r.file_token,
-                                    offset=offset_bytes,
-                                    limit=chunk_size
-                                )
-                            )
-
-                            if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
-                                try:
-                                    await session.invoke(
-                                        raw.functions.upload.ReuploadCdnFile(
-                                            file_token=r.file_token,
-                                            request_token=r2.request_token
-                                        )
-                                    )
-                                except VolumeLocNotFound:
-                                    break
-                                else:
-                                    continue
-
-                            chunk = r2.bytes
-
-                            decrypted_chunk = aes.ctr256_decrypt(
-                                chunk,
-                                r.encryption_key,
-                                bytearray(
-                                    r.encryption_iv[:-4]
-                                    + (offset_bytes // 16).to_bytes(4, "big")
-                                )
-                            )
-
-                            hashes = await session.invoke(
-                                raw.functions.upload.GetCdnFileHashes(
-                                    file_token=r.file_token,
-                                    offset=offset_bytes
-                                )
-                            )
-
-                            for i, h in enumerate(hashes):
-                                cdn_chunk = decrypted_chunk[h.limit * i: h.limit * (i + 1)]
-                                CDNFileHashMismatch.check(
-                                    h.hash == sha256(cdn_chunk).digest(),
-                                    "h.hash == sha256(cdn_chunk).digest()"
-                                )
-
-                            yield decrypted_chunk
-
-                            current += 1
-                            offset_bytes += chunk_size
-
-                            if progress:
-                                func = functools.partial(
-                                    progress,
-                                    min(offset_bytes, file_size) if file_size != 0 else offset_bytes,
-                                    file_size,
-                                    *progress_args
-                                )
-
-                                if inspect.iscoroutinefunction(progress):
-                                    await func()
-                                else:
-                                    await self.loop.run_in_executor(self.executor, func)
-
-                            if len(chunk) < chunk_size or current >= total:
-                                break
-                    except Exception as e:
-                        raise e
-                    finally:
-                        await cdn_session.stop()
             except pyrogram.StopTransmissionError:
                 raise
             except (FloodWait, FloodPremiumWait):
