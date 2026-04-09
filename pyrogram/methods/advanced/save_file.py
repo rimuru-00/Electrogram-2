@@ -168,7 +168,7 @@ class SaveFile:
             queue: asyncio.Queue = asyncio.Queue(32)
 
             with (
-                Path(path).open("rb", buffering=4096)  # noqa: ASYNC230
+                Path(path).open("rb", buffering=part_size)  # noqa: ASYNC230
                 if isinstance(path, str | PurePath)
                 else path
             ) as fp:
