@@ -337,8 +337,6 @@ class Client(Methods):
         self.media_sessions_timestamps: dict[int, float] = {}
         self.media_sessions_last_used: dict[int, float] = {}
         self.media_sessions_lock = asyncio.Lock()
-        self.parallel_media_sessions: dict[int, list[Session]] = {}
-        self.parallel_media_sessions_lock = asyncio.Lock()
         # upload_sessions: separate cached session pool for uploads.
         # Kept separate from media_sessions so a long upload never evicts
         # a download session and vice versa.
@@ -956,64 +954,6 @@ class Client(Methods):
             else:
                 log.warning('[%s] No plugin loaded from "%s"', self.name, root)
 
-    async def _create_media_session(self, dc_id: int) -> Session:
-        auth_key = (
-            await Auth(self, dc_id, await self.storage.test_mode()).create()
-            if dc_id != await self.storage.dc_id()
-            else await self.storage.auth_key()
-        )
-        session = Session(
-            self, dc_id, auth_key,
-            await self.storage.test_mode(),
-            is_media=True,
-        )
-        await session.start()
-
-        if dc_id != await self.storage.dc_id():
-            for attempt in range(3):
-                exported = await self.invoke(
-                    raw.functions.auth.ExportAuthorization(dc_id=dc_id)
-                )
-                try:
-                    await session.invoke(
-                        raw.functions.auth.ImportAuthorization(
-                            id=exported.id,
-                            bytes=exported.bytes,
-                        )
-                    )
-                    break
-                except AuthBytesInvalid:
-                    if attempt == 2:
-                        await session.stop()
-                        raise
-        return session
-
-    async def _get_parallel_sessions(
-        self, dc_id: int, count: int = 4
-    ) -> list[Session]:
-        async with self.parallel_media_sessions_lock:
-            existing: list[Session] = self.parallel_media_sessions.get(dc_id, [])
-
-            healthy: list[Session] = []
-            for s in existing:
-                if s.is_started.is_set():
-                    healthy.append(s)
-                else:
-                    with contextlib.suppress(Exception):
-                        await s.stop()
-
-            needed = count - len(healthy)
-            if needed > 0:
-                new_sessions: list[Session] = list(
-                    await asyncio.gather(
-                        *[self._create_media_session(dc_id) for _ in range(needed)]
-                    )
-                )
-                healthy.extend(new_sessions)
-
-            self.parallel_media_sessions[dc_id] = healthy
-            return healthy
-
     async def handle_download(self, packet) -> str | BinaryIO | None:
         (
             file_id,
@@ -1081,9 +1021,12 @@ class Client(Methods):
         # which is proven safe on a single MTProto session.
         # Only activated for files > 10 MB; small files finish in
         # 1–2 chunks so parallelism adds overhead with no benefit.
-        _PARALLEL_SESSIONS   = 4
-        _PARALLEL_THRESHOLD  = 10 * 1024 * 1024
-        _QUEUE_BUFFER        = 8
+        _PREFETCH_COUNT = 4
+        _BIG_FILE_THRESHOLD = 10 * 1024 * 1024
+
+        # Skip the network ping if the session was used within this
+        # many seconds — a recently active socket is almost certainly
+        # alive, and the ping adds a full RTT before every download.
         _PING_IDLE_THRESHOLD = 30.0
 
         async with self.get_file_semaphore:
@@ -1182,14 +1125,46 @@ class Client(Methods):
                             with contextlib.suppress(Exception):
                                 await session.stop()
 
-                        session = await self._create_media_session(dc_id)
+                        session = Session(
+                            self, dc_id,
+                            await Auth(self, dc_id, await self.storage.test_mode()).create()
+                            if dc_id != await self.storage.dc_id()
+                            else await self.storage.auth_key(),
+                            await self.storage.test_mode(),
+                            is_media=True
+                        )
+
+                        await session.start()
+
+                        if dc_id != await self.storage.dc_id():
+                            for _ in range(3):
+                                exported_auth = await self.invoke(
+                                    raw.functions.auth.ExportAuthorization(
+                                        dc_id=dc_id
+                                    )
+                                )
+
+                                try:
+                                    await session.invoke(
+                                        raw.functions.auth.ImportAuthorization(
+                                            id=exported_auth.id,
+                                            bytes=exported_auth.bytes
+                                        )
+                                    )
+                                except AuthBytesInvalid:
+                                    continue
+                                else:
+                                    break
+                            else:
+                                raise AuthBytesInvalid
+
                         self.media_sessions[dc_id] = session
                         self.media_sessions_timestamps[dc_id] = current_time
                         self.media_sessions_last_used[dc_id] = current_time
 
-                # ── Helper: fetch one chunk ───────────────────────────────
-                async def fetch_chunk(sess: Session, ob: int) -> bytes:
-                    r = await sess.invoke(
+                # ── Helper: fetch one chunk, returns (ordered_index, bytes) ──
+                async def fetch_chunk(ob: int) -> bytes:
+                    r = await session.invoke(
                         raw.functions.upload.GetFile(
                             location=location,
                             offset=ob,
@@ -1199,87 +1174,69 @@ class Client(Methods):
                     )
                     return r.bytes if isinstance(r, raw.types.upload.File) else b""
 
-                use_parallel = file_size > _PARALLEL_THRESHOLD and limit == 0
+                is_big = file_size > _BIG_FILE_THRESHOLD
+                use_prefetch = is_big and limit == 0  # prefetch only for full-file downloads
 
-                if use_parallel:
-                    sessions = await self._get_parallel_sessions(dc_id, _PARALLEL_SESSIONS)
+                if use_prefetch:
+                    # ── Parallel prefetch path (large files only) ─────────────
+                    # Launch up to _PREFETCH_COUNT futures at once.
+                    # All share the same cached session — MTProto multiplexes
+                    # them safely over the single TCP connection.
+                    # Chunks are collected and yielded strictly in order so the
+                    # caller always gets a contiguous byte stream.
+                    pending: list[asyncio.Task] = []
+                    next_offset = offset_bytes
 
-                    aligned_part: int = (
-                        file_size // _PARALLEL_SESSIONS // chunk_size
-                    ) * chunk_size
-
-                    ranges: list[tuple[int, int]] = [
-                        (
-                            i * aligned_part,
-                            (i + 1) * aligned_part if i < _PARALLEL_SESSIONS - 1 else file_size,
-                        )
-                        for i in range(_PARALLEL_SESSIONS)
-                    ]
-
-                    queues: list[asyncio.Queue] = [
-                        asyncio.Queue(maxsize=_QUEUE_BUFFER)
-                        for _ in range(_PARALLEL_SESSIONS)
-                    ]
-
-                    async def _download_range(
-                        sess: Session,
-                        start: int,
-                        stop: int,
-                        queue: asyncio.Queue,
-                    ) -> None:
-                        off = start
-                        try:
-                            while off < stop:
-                                data = await fetch_chunk(sess, off)
-                                if not data:
-                                    break
-                                await queue.put(data)
-                                off += chunk_size
-                        except Exception as exc:
-                            await queue.put(exc)
-                        finally:
-                            await queue.put(None)
-
-                    tasks = [
-                        self.loop.create_task(
-                            _download_range(
-                                sessions[i], ranges[i][0], ranges[i][1], queues[i]
-                            )
-                        )
-                        for i in range(_PARALLEL_SESSIONS)
-                    ]
-
-                    bytes_yielded = offset_bytes
+                    # Seed the pipeline
+                    for _ in range(_PREFETCH_COUNT):
+                        pending.append(self.loop.create_task(fetch_chunk(next_offset)))
+                        next_offset += chunk_size
 
                     try:
-                        for queue in queues:
-                            while True:
-                                item = await queue.get()
-                                if item is None:
-                                    break
-                                if isinstance(item, Exception):
-                                    raise item
-                                yield item
-                                self.media_sessions_last_used[dc_id] = time.time()
-                                bytes_yielded += len(item)
-                                if progress:
-                                    func = functools.partial(
-                                        progress,
-                                        min(bytes_yielded, file_size) if file_size != 0 else bytes_yielded,
-                                        file_size,
-                                        *progress_args,
-                                    )
-                                    if inspect.iscoroutinefunction(progress):
-                                        await func()
-                                    else:
-                                        await self.loop.run_in_executor(self.executor, func)
+                        while pending:
+                            # Await the oldest in-flight chunk (strict ordering)
+                            chunk = await pending.pop(0)
+
+                            if not chunk:
+                                # Cancel any remaining prefetch tasks
+                                for t in pending:
+                                    t.cancel()
+                                pending.clear()
+                                break
+
+                            yield chunk
+                            self.media_sessions_last_used[dc_id] = time.time()
+
+                            current += 1
+                            offset_bytes += chunk_size
+
+                            if progress:
+                                func = functools.partial(
+                                    progress,
+                                    min(offset_bytes, file_size) if file_size != 0 else offset_bytes,
+                                    file_size,
+                                    *progress_args,
+                                )
+                                if inspect.iscoroutinefunction(progress):
+                                    await func()
+                                else:
+                                    await self.loop.run_in_executor(self.executor, func)
+
+                            if len(chunk) < chunk_size or current >= total:
+                                # Done — cancel remaining prefetch tasks
+                                for t in pending:
+                                    t.cancel()
+                                pending.clear()
+                                break
+
+                            # Slide window: launch the next chunk
+                            pending.append(self.loop.create_task(fetch_chunk(next_offset)))
+                            next_offset += chunk_size
+
                     except (pyrogram.StopTransmissionError, FloodWait, FloodPremiumWait):
+                        for t in pending:
+                            t.cancel()
                         raise
-                    finally:
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
 
                 else:
                     # ── Sequential path (small files / streaming) ─────────────
